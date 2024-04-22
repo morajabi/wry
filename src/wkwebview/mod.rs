@@ -441,6 +441,15 @@ impl InnerWebView {
       }
 
       #[cfg(target_os = "macos")]
+      if util::operating_system_version().0 >= 14 {
+        // Only available on macOS 14+
+        // https://developer.apple.com/documentation/webkit/wkpreferences/4173317-inactiveschedulingpolicy
+        // WKPreferences.InactiveSchedulingPolicy.none = 2
+        let _none: id = msg_send![class!(NSNumber), numberWithInt:2];
+        let _: id = msg_send![_preference, setValue:_none forKey:NSString::new("inactiveSchedulingPolicy")];
+      }
+
+      #[cfg(target_os = "macos")]
       let _: id = msg_send![_preference, setValue:_yes forKey:NSString::new("tabFocusesLinks")];
 
       #[cfg(feature = "transparent")]

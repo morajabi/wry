@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT
 
 use cocoa::{base::id, foundation::NSOperatingSystemVersion};
-use cocoa::{base::id, foundation::NSOperatingSystemVersion};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub struct Counter(AtomicU32);

@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use cocoa::{base::id, foundation::NSOperatingSystemVersion};
+use cocoa::{base::id, foundation::NSOperatingSystemVersion};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub struct Counter(AtomicU32);
 
@@ -17,7 +18,6 @@ impl Counter {
     self.0.fetch_add(1, Ordering::Relaxed)
   }
 }
-
 
 pub(super) fn operating_system_version() -> (u64, u64, u64) {
   unsafe {

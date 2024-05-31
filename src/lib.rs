@@ -232,6 +232,8 @@ use webkitgtk::*;
 pub(crate) mod wkwebview;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use wkwebview::*;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub use wkwebview::{PrintMargin, PrintOptions};
 
 #[cfg(target_os = "windows")]
 pub(crate) mod webview2;
@@ -1032,6 +1034,38 @@ impl<'a> WebViewBuilder<'a> {
   }
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios",))]
+#[derive(Clone)]
+pub(crate) struct PlatformSpecificWebViewAttributes {
+  data_store_identifier: Option<[u8; 16]>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios",))]
+impl Default for PlatformSpecificWebViewAttributes {
+  fn default() -> Self {
+    Self {
+      data_store_identifier: None,
+    }
+  }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios",))]
+pub trait WebViewBuilderExtDarwin {
+  /// Initialize the WebView with a custom data store identifier.
+  /// Can be used as a replacement for data_directory not being available in WKWebView.
+  ///
+  /// - **macOS / iOS**: Available on macOS >= 14 and iOS >= 17
+  fn with_data_store_identifier(self, identifier: [u8; 16]) -> Self;
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios",))]
+impl WebViewBuilderExtDarwin for WebViewBuilder<'_> {
+  fn with_data_store_identifier(mut self, identifier: [u8; 16]) -> Self {
+    self.platform_specific.data_store_identifier = Some(identifier);
+    self
+  }
+}
+
 #[cfg(windows)]
 #[derive(Clone)]
 pub(crate) struct PlatformSpecificWebViewAttributes {
@@ -1566,6 +1600,8 @@ pub trait WebViewExtMacOS {
   fn ns_window(&self) -> cocoa::base::id;
   /// Attaches this webview to the given NSWindow and removes it from the current one.
   fn reparent(&self, window: cocoa::base::id) -> Result<()>;
+  // Prints with extra options
+  fn print_with_options(&self, options: &PrintOptions) -> Result<()>;
 }
 
 #[cfg(target_os = "macos")]
@@ -1587,6 +1623,10 @@ impl WebViewExtMacOS for WebView {
 
   fn reparent(&self, window: cocoa::base::id) -> Result<()> {
     self.webview.reparent(window)
+  }
+
+  fn print_with_options(&self, options: &PrintOptions) -> Result<()> {
+    self.webview.print_with_options(options)
   }
 }
 
@@ -1653,8 +1693,6 @@ pub enum PageLoadEvent {
   target_os = "freebsd",
   target_os = "netbsd",
   target_os = "openbsd",
-  target_os = "ios",
-  target_os = "macos",
 ))]
 #[derive(Default)]
 pub(crate) struct PlatformSpecificWebViewAttributes;

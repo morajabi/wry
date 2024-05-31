@@ -32,7 +32,11 @@ use std::{
   sync::{Arc, Mutex},
 };
 
-use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+use core_graphics::{
+  base::CGFloat,
+  geometry::{CGPoint, CGRect, CGSize},
+};
+
 use objc::{
   declare::ClassDecl,
   runtime::{Class, Object, Sel, BOOL},
@@ -78,6 +82,19 @@ const NS_JSON_WRITING_FRAGMENTS_ALLOWED: u64 = 4;
 
 static COUNTER: Counter = Counter::new();
 static WEBVIEW_IDS: Lazy<Mutex<HashSet<u32>>> = Lazy::new(Default::default);
+
+#[derive(Debug, Default, Copy, Clone)]
+pub struct PrintMargin {
+  pub top: f32,
+  pub right: f32,
+  pub bottom: f32,
+  pub left: f32,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct PrintOptions {
+  pub margins: PrintMargin,
+}
 
 pub(crate) struct InnerWebView {
   pub webview: id,
@@ -135,7 +152,7 @@ impl InnerWebView {
   fn new_ns_view(
     ns_view: id,
     attributes: WebViewAttributes,
-    _pl_attrs: super::PlatformSpecificWebViewAttributes,
+    pl_attrs: super::PlatformSpecificWebViewAttributes,
     _web_context: Option<&mut WebContext>,
     is_child: bool,
   ) -> Result<Self> {
@@ -144,7 +161,7 @@ impl InnerWebView {
       // Safety: objc runtime calls are unsafe
       unsafe {
         #[cfg(feature = "tracing")]
-        let _span = tracing::info_span!("wry::ipc::handle").entered();
+        let _span = tracing::info_span!(parent: None, "wry::ipc::handle").entered();
 
         let function = this.get_ivar::<*mut c_void>("function");
         if !function.is_null() {
@@ -179,7 +196,7 @@ impl InnerWebView {
     extern "C" fn start_task(this: &Object, _: Sel, _webview: id, task: id) {
       unsafe {
         #[cfg(feature = "tracing")]
-        let span = tracing::info_span!("wry::custom_protocol::handle", uri = tracing::field::Empty)
+        let span = tracing::info_span!(parent: None, "wry::custom_protocol::handle", uri = tracing::field::Empty)
           .entered();
         let webview_id = *this.get_ivar::<u32>("webview_id");
 
@@ -217,7 +234,9 @@ impl InnerWebView {
           if !body.is_null() {
             let length = msg_send![body, length];
             let data_bytes: id = msg_send![body, bytes];
-            sent_form_body = slice::from_raw_parts(data_bytes as *const u8, length).to_vec();
+            if !data_bytes.is_null() {
+              sent_form_body = slice::from_raw_parts(data_bytes as *const u8, length).to_vec();
+            }
           } else if !body_stream.is_null() {
             let _: () = msg_send![body_stream, open];
 
@@ -332,11 +351,28 @@ impl InnerWebView {
       let config: id = msg_send![class!(WKWebViewConfiguration), new];
       let mut protocol_ptrs = Vec::new();
 
-      // Incognito mode
-      let data_store: id = if attributes.incognito {
-        msg_send![class!(WKWebsiteDataStore), nonPersistentDataStore]
-      } else {
-        msg_send![class!(WKWebsiteDataStore), defaultDataStore]
+      let os_version = util::operating_system_version();
+
+      #[cfg(target_os = "macos")]
+      let custom_data_store_available = os_version.0 >= 14;
+
+      #[cfg(target_os = "ios")]
+      let custom_data_store_available = os_version.0 >= 17;
+
+      let data_store: id = match (
+        attributes.incognito,
+        custom_data_store_available,
+        pl_attrs.data_store_identifier,
+      ) {
+        // incognito has priority
+        (true, _, _) => msg_send![class!(WKWebsiteDataStore), nonPersistentDataStore],
+        // if data_store_identifier is given and custom data stores are available, use custom store
+        (false, true, Some(data_store)) => {
+          let ns_uuid = NSUUID::new(&data_store);
+          msg_send![class!(WKWebsiteDataStore), dataStoreForIdentifier:ns_uuid.0]
+        }
+        // default data store
+        _ => msg_send![class!(WKWebsiteDataStore), defaultDataStore],
       };
 
       for (name, function) in attributes.custom_protocols {
@@ -381,15 +417,6 @@ impl InnerWebView {
               sel!(acceptsFirstMouse:),
               accept_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL,
             );
-            decl.add_method(
-              sel!(performKeyEquivalent:),
-              key_equivalent as extern "C" fn(&mut Object, Sel, id) -> BOOL,
-            );
-
-            extern "C" fn key_equivalent(_this: &mut Object, _sel: Sel, _event: id) -> BOOL {
-              NO
-            }
-
             extern "C" fn accept_first_mouse(this: &Object, _sel: Sel, _event: id) -> BOOL {
               unsafe {
                 let accept: bool = *this.get_ivar(ACCEPT_FIRST_MOUSE);
@@ -398,6 +425,21 @@ impl InnerWebView {
                 } else {
                   NO
                 }
+              }
+            }
+
+            // This is a temporary workaround for https://github.com/tauri-apps/tauri/issues/9426
+            // FIXME: When the webview is a child webview, performKeyEquivalent always return YES
+            // and stop propagating the event to the window, hence the menu shortcut won't be
+            // triggered. However, overriding this method also means the cmd+key event won't be
+            // handled in webview, which means the key cannot be listened by JavaScript.
+            if is_child {
+              decl.add_method(
+                sel!(performKeyEquivalent:),
+                key_equivalent as extern "C" fn(&mut Object, Sel, id) -> BOOL,
+              );
+              extern "C" fn key_equivalent(_this: &mut Object, _sel: Sel, _event: id) -> BOOL {
+                NO
               }
             }
           }
@@ -1054,10 +1096,8 @@ r#"Object.defineProperty(window, 'ipc', {
     unsafe {
       let userscript: id = msg_send![class!(WKUserScript), alloc];
       let script: id =
-      // FIXME: We allow subframe injection because webview2 does and cannot be disabled (currently).
-      // once webview2 allows disabling all-frame script injection, forMainFrameOnly should be enabled
-      // if it does not break anything. (originally added for isolation pattern).
-        msg_send![userscript, initWithSource:NSString::new(js) injectionTime:0 forMainFrameOnly:0];
+      // TODO: feature to allow injecting into subframes
+        msg_send![userscript, initWithSource:NSString::new(js) injectionTime:0 forMainFrameOnly:1];
       let _: () = msg_send![self.manager, addUserScript: script];
     }
   }
@@ -1114,6 +1154,10 @@ r#"Object.defineProperty(window, 'ipc', {
   }
 
   pub fn print(&self) -> crate::Result<()> {
+    self.print_with_options(&PrintOptions::default())
+  }
+
+  pub fn print_with_options(&self, options: &PrintOptions) -> crate::Result<()> {
     // Safety: objc runtime calls are unsafe
     #[cfg(target_os = "macos")]
     unsafe {
@@ -1125,6 +1169,10 @@ r#"Object.defineProperty(window, 'ipc', {
         // Create a shared print info
         let print_info: id = msg_send![class!(NSPrintInfo), sharedPrintInfo];
         let print_info: id = msg_send![print_info, init];
+        let () = msg_send![print_info, setTopMargin:CGFloat::from(options.margins.top)];
+        let () = msg_send![print_info, setRightMargin:CGFloat::from(options.margins.right)];
+        let () = msg_send![print_info, setBottomMargin:CGFloat::from(options.margins.bottom)];
+        let () = msg_send![print_info, setLeftMargin:CGFloat::from(options.margins.left)];
         // Create new print operation from the webview content
         let print_operation: id = msg_send![self.webview, printOperationWithPrintInfo: print_info];
         // Allow the modal to detach from the current thread and be non-blocker
@@ -1330,6 +1378,21 @@ impl Drop for InnerWebView {
 
 const UTF8_ENCODING: usize = 4;
 
+struct NSUUID(id);
+
+impl NSUUID {
+  fn new(data: &[u8; 16]) -> Self {
+    NSUUID(unsafe {
+      let ns_uuid: id = msg_send![class!(NSUUID), alloc];
+      let ns_uuid: id = msg_send![ns_uuid, initWithUUIDBytes:data.as_ptr()];
+
+      let _: () = msg_send![ns_uuid, autorelease];
+
+      ns_uuid
+    })
+  }
+}
+
 struct NSString(id);
 
 impl NSString {
@@ -1384,6 +1447,7 @@ impl From<NSData> for NSString {
   }
 }
 
+#[allow(dead_code)] // rustc complains `id` is unused, but it is actually used from Objective-C
 struct NSData(id);
 
 /// Converts from wry screen-coordinates to macOS screen-coordinates.
